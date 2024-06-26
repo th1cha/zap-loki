@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,9 @@ type logEntry struct {
 }
 
 func New(ctx context.Context, cfg Config) ZapLoki {
+	cfg.Url = strings.TrimSuffix(cfg.Url, "/")
+	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", cfg.Url)
+
 	ctx, cancel := context.WithCancel(ctx)
 	lp := &lokiPusher{
 		config:  &cfg,
