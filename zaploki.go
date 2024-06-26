@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,22 +24,10 @@ type ZapLoki interface {
 	WithCreateLogger(zap.Config) (*zap.Logger, error)
 }
 
-type Config struct {
-	// Url of the loki server including http:// or https://
-	Url string
-	// BatchMaxSize is the maximum number of log lines that are sent in one request
-	BatchMaxSize int
-	// BatchMaxWait is the maximum time to wait before sending a request
-	BatchMaxWait time.Duration
-	// Labels that are added to all log lines
-	Labels   map[string]string
-	Username string
-	Password string
-}
-
 type lokiPusher struct {
 	config    *Config
 	ctx       context.Context
+	cancel    context.CancelFunc
 	client    *http.Client
 	quit      chan struct{}
 	entries   chan logEntry
@@ -65,22 +52,18 @@ type logEntry struct {
 }
 
 func New(ctx context.Context, cfg Config) ZapLoki {
-	c := &http.Client{}
-
-	cfg.Url = strings.TrimSuffix(cfg.Url, "/")
-	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", cfg.Url)
-
-	pusher := &lokiPusher{
+	ctx, cancel := context.WithCancel(ctx)
+	lp := &lokiPusher{
 		config:  &cfg,
 		ctx:     ctx,
-		client:  c,
+		cancel:  cancel,
+		client:  &http.Client{},
 		quit:    make(chan struct{}),
-		entries: make(chan logEntry),
+		entries: make(chan logEntry, 100), // Adjust buffer size as needed
 	}
-
-	pusher.waitGroup.Add(1)
-	go pusher.run()
-	return pusher
+	lp.waitGroup.Add(1)
+	go lp.run()
+	return lp
 }
 
 // Hook is a function that can be used as a zap hook to write log lines to loki
@@ -103,11 +86,24 @@ func (lp *lokiPusher) Sink(_ *url.URL) (zap.Sink, error) {
 func (lp *lokiPusher) Stop() {
 	close(lp.quit)
 	lp.waitGroup.Wait()
+	lp.cancel()
+}
+
+var (
+	registerSinkOnce sync.Once
+)
+
+func registerLokiSink(lp *lokiPusher) error {
+	var err error
+	registerSinkOnce.Do(func() {
+		err = zap.RegisterSink(lokiSinkKey, lp.Sink)
+	})
+	return err
 }
 
 // WithCreateLogger creates a new zap logger with a loki sink from a zap config
 func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
-	err := zap.RegisterSink(lokiSinkKey, lp.Sink)
+	err := registerLokiSink(lp)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -124,14 +120,15 @@ func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
 }
 
 func (lp *lokiPusher) run() {
-	var batch []logEntry
-	ticker := time.NewTimer(lp.config.BatchMaxWait)
+	ticker := time.NewTicker(lp.config.BatchMaxWait)
+	defer ticker.Stop()
+
+	batch := make([]logEntry, 0, lp.config.BatchMaxSize)
 
 	defer func() {
 		if len(batch) > 0 {
 			lp.send(batch)
 		}
-
 		lp.waitGroup.Done()
 	}()
 
@@ -145,33 +142,26 @@ func (lp *lokiPusher) run() {
 			batch = append(batch, entry)
 			if len(batch) >= lp.config.BatchMaxSize {
 				lp.send(batch)
-				batch = make([]logEntry, 0)
-				ticker.Reset(lp.config.BatchMaxWait)
+				batch = batch[:0]
 			}
 		case <-ticker.C:
 			if len(batch) > 0 {
 				lp.send(batch)
-				batch = make([]logEntry, 0)
+				batch = batch[:0]
 			}
-			ticker.Reset(lp.config.BatchMaxWait)
 		}
 	}
 }
 
 func (lp *lokiPusher) send(batch []logEntry) error {
-	data := lokiPushRequest{}
-
-	var logs [][2]string
-	for _, entry := range batch {
-		ts := time.Unix(int64(entry.Timestamp), 0)
-		v := [2]string{strconv.FormatInt(ts.UnixNano(), 10), entry.raw}
-		logs = append(logs, v)
+	data := lokiPushRequest{
+		Streams: []stream{
+			{
+				Stream: lp.config.Labels,
+				Values: formatLogEntries(batch),
+			},
+		},
 	}
-
-	data.Streams = append(data.Streams, stream{
-		Stream: lp.config.Labels,
-		Values: logs,
-	})
 
 	msg, err := json.Marshal(data)
 	if err != nil {
@@ -195,8 +185,8 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
 
-	if lp.config.Username != "" && lp.config.Password != "" {
-		req.SetBasicAuth(lp.config.Username, lp.config.Password)
+	if lp.config.Auth != nil {
+		lp.config.Auth.Apply(req)
 	}
 
 	resp, err := lp.client.Do(req)
@@ -211,4 +201,13 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 	}
 
 	return nil
+}
+
+func formatLogEntries(entries []logEntry) [][2]string {
+	logs := make([][2]string, len(entries))
+	for i, entry := range entries {
+		ts := time.Unix(int64(entry.Timestamp), 0)
+		logs[i] = [2]string{strconv.FormatInt(ts.UnixNano(), 10), entry.raw}
+	}
+	return logs
 }
