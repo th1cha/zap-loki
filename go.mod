@@ -1,6 +1,6 @@
 module github.com/th1cha/zap-loki
 
-go 1.20
+go 1.21.1
 
 require go.uber.org/zap v1.27.0
 
